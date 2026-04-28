@@ -5,7 +5,7 @@ from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePublicKey
 
 from comet.cometnet.crypto import NodeIdentity
 from comet.cometnet.keystore import PublicKeyStore
-from comet.cometnet.protocol import BaseMessage, TorrentMetadata
+from comet.cometnet.protocol import AnyMessage, TorrentMetadata
 from comet.cometnet.reputation import ReputationStore
 from comet.cometnet.utils import run_in_executor
 from comet.core.logger import logger
@@ -13,7 +13,7 @@ from comet.core.models import settings
 
 
 def verify_message_signature_sync(
-    message: BaseMessage, signature_bytes: bytes, public_key: EllipticCurvePublicKey
+    message: AnyMessage, signature_bytes: bytes, public_key: EllipticCurvePublicKey
 ) -> bool:
     """
     Verify message signature synchronously.
@@ -28,7 +28,7 @@ def verify_message_signature_sync(
 
 
 async def validate_message_security(
-    message: BaseMessage,
+    message: AnyMessage,
     sender_id: str,
     keystore: Optional[PublicKeyStore],
     reputation: Optional[ReputationStore],

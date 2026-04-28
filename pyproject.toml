@@ -27,7 +27,7 @@ dependencies = [
     "xxhash",
     "cryptography",
     "websockets",
-    "msgpack",
+    "msgspec",
     "miniupnpc",
     "aiofiles",
     "torrent-parse-rank",

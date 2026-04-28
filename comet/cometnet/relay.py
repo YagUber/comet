@@ -11,6 +11,8 @@ import traceback
 from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
+import msgspec
+import msgspec.structs
 
 from comet.cometnet.interface import CometNetBackend
 from comet.core.logger import logger
@@ -532,7 +534,9 @@ class CometNetRelay(CometNetBackend):
 
         batch_data = []
         for metadata in metadata_list:
-            if hasattr(metadata, "model_dump"):
+            if isinstance(metadata, msgspec.Struct):
+                data = msgspec.structs.asdict(metadata)
+            elif hasattr(metadata, "model_dump"):
                 data = metadata.model_dump()
             elif isinstance(metadata, dict):
                 data = metadata

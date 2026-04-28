@@ -885,7 +885,7 @@ class CometNetService(CometNetBackend):
                 creator_key=message.creator_key,
                 members=members,
                 join_mode=JoinMode(message.join_mode),
-                version=message.version,
+                version=message.manifest_version,
                 created_at=message.created_at,
                 updated_at=message.updated_at,
                 signatures=message.manifest_signatures,
@@ -985,7 +985,7 @@ class CometNetService(CometNetBackend):
 
                 logger.log(
                     "COMETNET",
-                    f"Received pool manifest: {message.display_name} ({message.pool_id}) v{message.version}",
+                    f"Received pool manifest: {message.display_name} ({message.pool_id}) v{message.manifest_version}",
                 )
         except Exception as e:
             logger.debug(f"Failed to process pool manifest: {e}")
@@ -1242,7 +1242,7 @@ class CometNetService(CometNetBackend):
             creator_key=manifest.creator_key,
             members=[m.model_dump() for m in manifest.members],
             join_mode=manifest.join_mode.value,
-            version=manifest.version,
+            manifest_version=manifest.version,
             created_at=manifest.created_at,
             updated_at=manifest.updated_at,
             manifest_signatures=manifest.signatures,
@@ -1262,7 +1262,7 @@ class CometNetService(CometNetBackend):
             creator_key=manifest.creator_key,
             members=[m.model_dump() for m in manifest.members],
             join_mode=manifest.join_mode.value,
-            version=manifest.version,
+            manifest_version=manifest.version,
             created_at=manifest.created_at,
             updated_at=manifest.updated_at,
             manifest_signatures=manifest.signatures,

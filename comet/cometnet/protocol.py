@@ -2,21 +2,26 @@
 CometNet Protocol Module
 
 Defines all message types and serialization logic for CometNet P2P communication.
-Uses MsgPack for efficient binary serialization.
+Uses MsgPack for efficient binary serialization via msgspec.
 """
 
 import time
 from enum import Enum
-from typing import List, Optional, Union
+from typing import ClassVar, List, Optional, Union
 
-import msgpack
-from pydantic import BaseModel, Field, field_validator
+import msgspec
+import msgspec.msgpack
+from msgspec import UNSET, UnsetType
 
-from comet.cometnet.utils import canonicalize_data
 from comet.utils.formatting import normalize_info_hash
 
 # Protocol version for backwards compatibility
 PROTOCOL_VERSION = "1.0"
+
+# Encoder used by both to_signable_bytes (excludes signature via UNSET)
+# and anywhere we need canonical/deterministic msgpack encoding.
+# order='sorted' sorts all map keys alphabetically at every nesting level.
+_CANONICAL_ENCODER = msgspec.msgpack.Encoder(order="sorted")
 
 
 class MessageType(str, Enum):
@@ -41,14 +46,26 @@ class MessageType(str, Enum):
     POOL_DELETE = "pool_delete"
 
 
-class BaseMessage(BaseModel):
+class BaseMessage(msgspec.Struct):
     """Base class for all CometNet messages."""
 
-    version: str = Field(default=PROTOCOL_VERSION)
-    type: MessageType
-    timestamp: float = Field(default_factory=time.time)
+    MESSAGE_TYPE: ClassVar[MessageType]
+
+    # Union[str, int] for backwards compatibility: old nodes incorrectly reused
+    # this field for the pool manifest revision number (an int), shadowing the
+    # protocol version string. PoolManifestMessage.__post_init__ migrates that
+    # integer into manifest_version so the value is not lost.
+    # TODO: revert to `str` once all nodes are on new code.
+    version: Union[str, int] = PROTOCOL_VERSION
+    timestamp: float = msgspec.field(default_factory=time.time)
     sender_id: str = ""  # Node ID of the sender
-    signature: str = ""  # Hex-encoded signature
+    # Union with UnsetType so to_signable_bytes can replace it with UNSET to
+    # omit the field from the canonical bytes without touching the wire format.
+    signature: Union[str, UnsetType] = ""  # Hex-encoded signature
+
+    @property
+    def type(self) -> MessageType:
+        return self.MESSAGE_TYPE
 
     def to_signable_bytes(self) -> bytes:
         """
@@ -56,20 +73,20 @@ class BaseMessage(BaseModel):
         Excludes the signature field itself.
         Uses MsgPack with sorted keys for stable canonicalization.
         """
-        data = self.model_dump(exclude={"signature"})
-        return msgpack.packb(canonicalize_data(data))
+        copy = msgspec.structs.replace(self, signature=UNSET)
+        return _CANONICAL_ENCODER.encode(copy)
 
     def to_bytes(self) -> bytes:
-        """Serialize the message to MsgPack bytes."""
-        return msgpack.packb(self.model_dump())
+        return msgspec.msgpack.encode(self)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "BaseMessage":
-        """Deserialize a message from MsgPack bytes."""
-        return cls.model_validate(msgpack.unpackb(data, raw=False))
+        return msgspec.msgpack.decode(data, type=cls)
 
 
-class HandshakeMessage(BaseMessage):
+class HandshakeMessage(
+    BaseMessage, tag_field="type", tag=MessageType.HANDSHAKE.value
+):
     """
     Initial handshake message sent when connecting to a peer.
 
@@ -77,30 +94,30 @@ class HandshakeMessage(BaseMessage):
     and future encrypted communications.
     """
 
-    type: MessageType = MessageType.HANDSHAKE
+    MESSAGE_TYPE = MessageType.HANDSHAKE
     public_key: str = ""  # Hex-encoded public key
     listen_port: int = 0  # Port this node is listening on (for reverse connections)
     public_url: Optional[str] = None  # Full public URL (for reverse proxies)
     alias: Optional[str] = None  # Friendly name for the node
-    capabilities: List[str] = Field(default_factory=list)  # Future extension
+    capabilities: List[str] = msgspec.field(default_factory=list)  # Future extension
     network_token: Optional[str] = None  # HMAC token for private network auth
 
 
-class PingMessage(BaseMessage):
+class PingMessage(BaseMessage, tag_field="type", tag=MessageType.PING.value):
     """Ping message to check if a peer is still alive."""
 
-    type: MessageType = MessageType.PING
+    MESSAGE_TYPE = MessageType.PING
     nonce: str = ""  # Random nonce for matching pong
 
 
-class PongMessage(BaseMessage):
+class PongMessage(BaseMessage, tag_field="type", tag=MessageType.PONG.value):
     """Pong response to a ping message."""
 
-    type: MessageType = MessageType.PONG
+    MESSAGE_TYPE = MessageType.PONG
     nonce: str = ""  # Echo of the ping nonce
 
 
-class PeerInfo(BaseModel):
+class PeerInfo(msgspec.Struct):
     """Information about a peer for exchange."""
 
     node_id: str
@@ -109,181 +126,193 @@ class PeerInfo(BaseModel):
     reputation: float = 50.0
 
 
-class PeerRequest(BaseMessage):
+class PeerRequest(BaseMessage, tag_field="type", tag=MessageType.PEER_REQUEST.value):
     """Request for a list of known peers."""
 
-    type: MessageType = MessageType.PEER_REQUEST
+    MESSAGE_TYPE = MessageType.PEER_REQUEST
     max_peers: int = 20  # Maximum number of peers to return
 
 
-class PeerResponse(BaseMessage):
+class PeerResponse(BaseMessage, tag_field="type", tag=MessageType.PEER_RESPONSE.value):
     """Response containing a list of known peers."""
 
-    type: MessageType = MessageType.PEER_RESPONSE
-    peers: List[PeerInfo] = Field(default_factory=list)
+    MESSAGE_TYPE = MessageType.PEER_RESPONSE
+    peers: List[PeerInfo] = msgspec.field(default_factory=list)
 
 
-class TorrentMetadata(BaseModel):
+class TorrentMetadata(msgspec.Struct):
     """
     Metadata for a torrent shared across the network.
 
     This is the core data structure that CometNet propagates.
     """
 
+    # Required fields first (no defaults)
     info_hash: str  # 40-character hex string
     title: str
     size: int  # Size in bytes
-    seeders: Optional[int] = None
     tracker: str  # Source/tracker name
     imdb_id: str
+
+    # Optional fields
+    seeders: Optional[int] = None
     file_index: Optional[int] = None
     season: Optional[int] = None
     episode: Optional[int] = None
-    sources: List[str] = Field(default_factory=list)
+    sources: List[str] = msgspec.field(default_factory=list)
     parsed: Optional[dict] = None  # Serialized RTN ParsedData
-    updated_at: float = Field(default_factory=time.time)
+    updated_at: float = msgspec.field(default_factory=time.time)
     contributor_id: str = ""  # Node ID of the original contributor
     contributor_public_key: str = (
         ""  # Public key of the original contributor (for validation)
     )
-    contributor_signature: str = ""  # Signature from the contributor
-
+    # Union with UnsetType so to_signable_bytes can omit this field without
+    # affecting the wire format (signature stays present as "" or hex string).
+    contributor_signature: Union[str, UnsetType] = ""
+    
     # Pool association
     pool_id: Optional[str] = None  # Pool this torrent belongs to (if any)
 
-    @field_validator("info_hash")
-    @classmethod
-    def validate_info_hash(cls, v: str) -> str:
-        """Validate that info_hash is a valid 40-character hex string."""
-        v = normalize_info_hash(v)
-
-        if len(v) != 40:
+    def __post_init__(self):
+        # Validate that info_hash is a valid 40-character hex string.
+        self.info_hash = normalize_info_hash(self.info_hash)
+        if len(self.info_hash) != 40:
             raise ValueError("info_hash must be 40 characters")
         try:
-            int(v, 16)
+            int(self.info_hash, 16)
         except ValueError:
             raise ValueError("info_hash must be valid hexadecimal")
-        return v
-
-    @field_validator("size")
-    @classmethod
-    def validate_size(cls, v: int) -> int:
-        """Validate that size is a reasonable value."""
-        if v < 0:
+        
+        # Validate that size is a reasonable value.
+        if self.size < 0:
             raise ValueError("size must be non-negative")
-        if v > 1024 * 1024 * 1024 * 1024 * 10:  # 10 TB max
+        if self.size > 10 * 1024**4:  # 10 TB max
             raise ValueError("size exceeds maximum allowed value")
-        return v
-
-    @field_validator("imdb_id")
-    @classmethod
-    def validate_imdb_id(cls, v: str) -> str:
-        """Require a non-empty media identifier for network torrent metadata."""
-        if not v:
+        
+        # Require a non-empty media identifier for network torrent metadata.
+        if not self.imdb_id:
             raise ValueError("imdb_id is required")
-        return v
 
     def to_signable_bytes(self) -> bytes:
         """Returns bytes for signing (excludes contributor_signature)."""
-        data = self.model_dump(exclude={"contributor_signature"})
-        return msgpack.packb(canonicalize_data(data))
+        copy = msgspec.structs.replace(self, contributor_signature=UNSET)
+        return _CANONICAL_ENCODER.encode(copy)
 
 
-class TorrentAnnounce(BaseMessage):
+class TorrentAnnounce(
+    BaseMessage, tag_field="type", tag=MessageType.TORRENT_ANNOUNCE.value
+):
     """
     Announce one or more torrents to the network.
 
     This is the primary gossip message for propagating torrent metadata.
     """
 
-    type: MessageType = MessageType.TORRENT_ANNOUNCE
-    torrents: List[TorrentMetadata] = Field(default_factory=list)
+    MESSAGE_TYPE = MessageType.TORRENT_ANNOUNCE
+    torrents: List[TorrentMetadata] = msgspec.field(default_factory=list)
     ttl: int = 5  # Time-to-live (hops remaining)
-
-    @field_validator("torrents")
-    @classmethod
-    def validate_torrents(cls, v: List[TorrentMetadata]) -> List[TorrentMetadata]:
-        """Validate that we don't exceed max torrents per message."""
-        if len(v) > 1000:
-            raise ValueError("Maximum 1000 torrents per announce message")
-        return v
-
-    visited_nodes: List[str] = Field(
+    visited_nodes: List[str] = msgspec.field(
         default_factory=list
     )  # List of nodes that have seen this message
+    
+    def __post_init__(self):
+        # Validate that we don't exceed max torrents per message.
+        if len(self.torrents) > 1000:
+            raise ValueError("Maximum 1000 torrents per announce message")
 
 
-class TorrentQuery(BaseMessage):
+class TorrentQuery(
+    BaseMessage, tag_field="type", tag=MessageType.TORRENT_QUERY.value
+):
     """Query for specific torrents (by info_hash or media ID)."""
 
-    type: MessageType = MessageType.TORRENT_QUERY
-    info_hashes: List[str] = Field(default_factory=list)
+    MESSAGE_TYPE = MessageType.TORRENT_QUERY
+    info_hashes: List[str] = msgspec.field(default_factory=list)
     imdb_id: Optional[str] = None
     limit: int = 50
 
 
-class TorrentResponse(BaseMessage):
+class TorrentResponse(
+    BaseMessage, tag_field="type", tag=MessageType.TORRENT_RESPONSE.value
+):
     """Response to a torrent query."""
 
-    type: MessageType = MessageType.TORRENT_RESPONSE
-    torrents: List[TorrentMetadata] = Field(default_factory=list)
+    MESSAGE_TYPE = MessageType.TORRENT_RESPONSE
+    torrents: List[TorrentMetadata] = msgspec.field(default_factory=list)
     query_id: str = ""  # Reference to the original query
 
 
 # ==================== Pool Messages ====================
 
 
-class PoolManifestMessage(BaseMessage):
+class PoolManifestMessage(
+    BaseMessage, tag_field="type", tag=MessageType.POOL_MANIFEST.value
+):
     """
     Broadcast or update a pool manifest.
 
     Used to propagate pool definitions across the network.
     """
 
-    type: MessageType = MessageType.POOL_MANIFEST
-    pool_id: str
-    display_name: str
+    MESSAGE_TYPE = MessageType.POOL_MANIFEST
+    pool_id: str = ""
+    display_name: str = ""
     description: str = ""
-    creator_key: str
-    members: List[dict] = Field(default_factory=list)  # Serialized PoolMembers
+    creator_key: str = ""
+    members: List[dict] = msgspec.field(default_factory=list)
     join_mode: str = "invite"
-    version: int = 1
+    # Renamed from 'version' to avoid shadowing BaseMessage.version (str).
+    # Old nodes encode pool manifest revision as "version" (int); __post_init__
+    # migrates that value here so it isn't silently lost.
+    manifest_version: int = 1
     created_at: float = 0.0  # Creation timestamp
     updated_at: float = 0.0  # Last update timestamp
-    manifest_signatures: dict = Field(default_factory=dict)  # admin_key -> sig
+    manifest_signatures: dict = msgspec.field(
+        default_factory=dict
+    )  # admin_key -> sig
+
+    def __post_init__(self):
+        if isinstance(self.version, int):
+            self.manifest_version = self.version
 
 
-class PoolJoinRequest(BaseMessage):
+class PoolJoinRequest(
+    BaseMessage, tag_field="type", tag=MessageType.POOL_JOIN_REQUEST.value
+):
     """Request to join a pool."""
 
-    type: MessageType = MessageType.POOL_JOIN_REQUEST
-    pool_id: str
+    MESSAGE_TYPE = MessageType.POOL_JOIN_REQUEST
+    pool_id: str = ""
     invite_code: Optional[str] = None  # For invite-based join
 
     requester_key: str = ""
     alias: Optional[str] = None  # Friendly name of the requester
 
 
-class PoolMemberUpdate(BaseMessage):
+class PoolMemberUpdate(
+    BaseMessage, tag_field="type", tag=MessageType.POOL_MEMBER_UPDATE.value
+):
     """Notify network of membership changes."""
 
-    type: MessageType = MessageType.POOL_MEMBER_UPDATE
-    pool_id: str
-    action: str  # "add", "remove", "promote", "demote"
-    member_key: str
+    MESSAGE_TYPE = MessageType.POOL_MEMBER_UPDATE
+    pool_id: str = ""
+    action: str = ""  # "add", "remove", "promote", "demote", "leave"
+    member_key: str = ""
     new_role: Optional[str] = None
     updated_by: str = ""  # Admin who made the change
-    manifest_signatures: dict = Field(
+    manifest_signatures: dict = msgspec.field(
         default_factory=dict
     )  # Signatures of the NEW manifest state
 
 
-class PoolDeleteMessage(BaseMessage):
+class PoolDeleteMessage(
+    BaseMessage, tag_field="type", tag=MessageType.POOL_DELETE.value
+):
     """Notify network that a pool has been deleted by its creator."""
 
-    type: MessageType = MessageType.POOL_DELETE
-    pool_id: str
-    deleted_by: str = ""  # Public key of the creator who deleted it
+    MESSAGE_TYPE = MessageType.POOL_DELETE
+    pool_id: str = ""
+    deleted_by: str = ""
 
 
 # Union type for all possible message types
@@ -302,47 +331,15 @@ AnyMessage = Union[
     PoolDeleteMessage,
 ]
 
+# Single tagged union decoder, dispatches via the "type" tag field
+_DECODER = msgspec.msgpack.Decoder(AnyMessage)
 
 def parse_message(data: Union[str, bytes]) -> Optional[AnyMessage]:
-    """
-    Parse MsgPack bytes into the appropriate message type.
-    """
+    """Parse MsgPack bytes into the appropriate message type."""
+    if isinstance(data, str):
+        # Should not happen, but handle graceful fail
+        return None
     try:
-        # Strict MsgPack parsing
-        if isinstance(data, str):
-            # Should not happen in pure MsgPack env, but handle graceful fail
-            return None
-
-        payload = msgpack.unpackb(data, raw=False)
-        msg_type = payload.get("type")
-
-        # Core messages
-        if msg_type == MessageType.HANDSHAKE:
-            return HandshakeMessage.model_validate(payload)
-        elif msg_type == MessageType.PING:
-            return PingMessage.model_validate(payload)
-        elif msg_type == MessageType.PONG:
-            return PongMessage.model_validate(payload)
-        elif msg_type == MessageType.PEER_REQUEST:
-            return PeerRequest.model_validate(payload)
-        elif msg_type == MessageType.PEER_RESPONSE:
-            return PeerResponse.model_validate(payload)
-        elif msg_type == MessageType.TORRENT_ANNOUNCE:
-            return TorrentAnnounce.model_validate(payload)
-        elif msg_type == MessageType.TORRENT_QUERY:
-            return TorrentQuery.model_validate(payload)
-        elif msg_type == MessageType.TORRENT_RESPONSE:
-            return TorrentResponse.model_validate(payload)
-        # Pool messages
-        elif msg_type == MessageType.POOL_MANIFEST:
-            return PoolManifestMessage.model_validate(payload)
-        elif msg_type == MessageType.POOL_JOIN_REQUEST:
-            return PoolJoinRequest.model_validate(payload)
-        elif msg_type == MessageType.POOL_MEMBER_UPDATE:
-            return PoolMemberUpdate.model_validate(payload)
-        elif msg_type == MessageType.POOL_DELETE:
-            return PoolDeleteMessage.model_validate(payload)
-        else:
-            return None
-    except (ValueError, Exception):
+        return _DECODER.decode(data)
+    except Exception:
         return None

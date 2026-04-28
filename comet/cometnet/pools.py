@@ -21,14 +21,26 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import aiofiles
-import msgpack
+import msgspec.msgpack
+from enum import Enum
 from pydantic import BaseModel, Field, computed_field, field_validator
 
 from comet.cometnet.crypto import NodeIdentity
-from comet.cometnet.utils import canonicalize_data, run_in_executor
+from comet.cometnet.utils import run_in_executor
+
 from comet.core.logger import logger
 from comet.core.models import settings
 
+# PoolManifest and PoolInvite are Pydantic models, not msgspec Structs. Pydantic's
+# model_dump() returns enum fields as enum objects (e.g. MemberRole.MEMBER), not plain
+# strings. msgspec's encoder rejects these when encoding a plain dict, so enc_hook
+# converts them to their string values before encoding.
+def _enc_hook(v):
+    if isinstance(v, Enum):
+        return v.value
+    raise TypeError(f"Cannot encode object of type {type(v)}")
+
+_CANONICAL_ENCODER = msgspec.msgpack.Encoder(order="sorted", enc_hook=_enc_hook)
 
 class MemberRole(str, Enum):
     """Roles within a pool."""
@@ -167,17 +179,7 @@ class PoolManifest(BaseModel):
                 data["members"], key=lambda m: m.get("public_key", "")
             )
 
-        # Ensure consistent ordering for deterministic serialization
-        return msgpack.packb(canonicalize_data(data))
-
-    def to_bytes(self) -> bytes:
-        """Serialize the manifest to MsgPack bytes."""
-        return msgpack.packb(self.model_dump())
-
-    @classmethod
-    def from_bytes(cls, data: bytes) -> "PoolManifest":
-        """Deserialize from MsgPack bytes."""
-        return cls.model_validate(msgpack.unpackb(data, raw=False))
+        return _CANONICAL_ENCODER.encode(data)
 
 
 class PoolInvite(BaseModel):
@@ -204,7 +206,7 @@ class PoolInvite(BaseModel):
     def to_signable_bytes(self) -> bytes:
         """Get bytes for signing."""
         data = self.model_dump(exclude={"signature", "uses"})
-        return msgpack.packb(canonicalize_data(data))
+        return _CANONICAL_ENCODER.encode(data)
 
     def to_link(self) -> str:
         """

@@ -55,29 +55,6 @@ def shutdown_crypto_executor() -> None:
         _crypto_executor = None
 
 
-# --- Data Normalization ---
-
-
-def canonicalize_data(data: Any) -> Any:
-    """
-    Recursively sort dict keys for deterministic serialization.
-    Used for creating stable signatures.
-    """
-    if isinstance(data, dict):
-        try:
-            return {k: canonicalize_data(v) for k, v in sorted(data.items())}
-        except TypeError:
-            # Fallback for mixed types that cannot be compared directly
-            return {
-                k: canonicalize_data(v)
-                for k, v in sorted(data.items(), key=lambda x: str(x[0]))
-            }
-    elif isinstance(data, list):
-        return [canonicalize_data(i) for i in data]
-    else:
-        return data
-
-
 # --- Network Utilities ---
 
 # Internal/suspicious domain patterns that should be blocked
