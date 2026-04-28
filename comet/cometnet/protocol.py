@@ -275,6 +275,23 @@ class PoolManifestMessage(
         if isinstance(self.version, int):
             self.manifest_version = self.version
 
+    # TODO: figure out if this is worth a protocol version bump
+    def to_signable_bytes(self) -> bytes:
+        copy = msgspec.structs.replace(self, signature=UNSET)
+        if not isinstance(self.version, int):
+            return _CANONICAL_ENCODER.encode(copy)
+        # Old nodes signed without manifest_version (the field didn't exist).
+        # Reproduce their canonical bytes by building the map manually.
+        d = {}
+        for field in msgspec.structs.fields(copy):
+            if field.name == "manifest_version":
+                continue
+            val = getattr(copy, field.name)
+            if val is not UNSET:
+                d[field.name] = val
+        d["type"] = self.MESSAGE_TYPE.value
+        return _CANONICAL_ENCODER.encode(d)
+
 
 class PoolJoinRequest(
     BaseMessage, tag_field="type", tag=MessageType.POOL_JOIN_REQUEST.value
